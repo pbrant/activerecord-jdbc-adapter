@@ -22,15 +22,8 @@ namespace :db do
         ActiveRecord::Base.connection
       rescue
         begin
-          url = config['url']
-          if url
-            if url =~ /^(.*\/)/
-              url = $1
-            end
-          end
-
-          ActiveRecord::Base.establish_connection(config.merge({'database' => nil, 'url' => url}))
-          ActiveRecord::Base.connection.create_database(config['database'])
+          ActiveRecord::Base.establish_connection(config.merge({'database' => nil, 'url' => url_host_target(config)}))
+          ActiveRecord::Base.connection.create_database(config['database'], config)
           ActiveRecord::Base.establish_connection(config)
         rescue
           previous_create_database(config)
@@ -38,11 +31,19 @@ namespace :db do
       end
     end
 
+    def url_host_target(config)
+      url = config['url']
+      $1 if url && url =~ /^(.*\/)/
+    end
+
     redefine_task :drop => :environment do
       config = ActiveRecord::Base.configurations[RAILS_ENV]
       begin
         ActiveRecord::Base.establish_connection(config)
         db = ActiveRecord::Base.connection.database_name
+        ActiveRecord::Base.connection.disconnect!
+
+        ActiveRecord::Base.establish_connection(config.merge({'database' => nil, 'url' => url_host_target(config)}))
         ActiveRecord::Base.connection.drop_database(db)
       rescue
         drop_database(config)
