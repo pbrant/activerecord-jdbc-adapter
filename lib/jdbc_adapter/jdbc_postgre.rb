@@ -86,6 +86,10 @@ module ::JdbcSpec
       end
     end
 
+    def supports_count_distinct? #:nodoc:
+      false
+    end
+
     def modify_types(tp)
       tp[:primary_key] = "serial primary key"
       tp[:string][:limit] = 255
@@ -109,12 +113,16 @@ module ::JdbcSpec
       if pk
         if sequence
           select_value <<-end_sql, 'Reset sequence'
-            SELECT setval('#{sequence}', (SELECT COALESCE(MAX(#{pk})+(SELECT increment_by FROM #{sequence}), (SELECT min_value FROM #{sequence})) FROM #{table}), false)
+            SELECT setval('#{sequence}', (SELECT COALESCE(MAX(#{quote_column_name(pk)})+(SELECT increment_by FROM #{sequence}), (SELECT min_value FROM #{sequence})) FROM #{quote_table_name(table)}), false)
           end_sql
         else
           @logger.warn "#{table} has primary key #{pk} with no default sequence" if @logger
         end
       end
+    end
+
+    def quote_regclass(table_name)
+      table_name.to_s.split('.').map { |part| quote_table_name(part) }.join('.')  
     end
 
     # Find a table's primary key and sequence.
@@ -136,7 +144,7 @@ module ::JdbcSpec
             AND attr.attrelid     = cons.conrelid
             AND attr.attnum       = cons.conkey[1]
             AND cons.contype      = 'p'
-            AND dep.refobjid      = '#{table}'::regclass
+            AND dep.refobjid      = '#{quote_regclass(table)}'::regclass
         end_sql
 
         if result.nil? or result.empty?
@@ -145,13 +153,13 @@ module ::JdbcSpec
           # the 8.1+ nextval('foo'::regclass).
           # TODO: assumes sequence is in same schema as table.
           result = select(<<-end_sql, 'PK and custom sequence')[0]
-            SELECT attr.attname AS nm, name.nspname AS nsp, split_part(def.adsrc, '\\\'', 2) AS rel
+            SELECT attr.attname AS nm, name.nspname AS nsp, split_part(def.adsrc, '''', 2) AS rel
             FROM pg_class       t
             JOIN pg_namespace   name ON (t.relnamespace = name.oid)
             JOIN pg_attribute   attr ON (t.oid = attrelid)
             JOIN pg_attrdef     def  ON (adrelid = attrelid AND adnum = attnum)
             JOIN pg_constraint  cons ON (conrelid = adrelid AND adnum = conkey[1])
-            WHERE t.oid = '#{table}'::regclass
+            WHERE t.oid = '#{quote_regclass(table)}'::regclass
               AND cons.contype = 'p'
               AND def.adsrc ~* 'nextval'
           end_sql
@@ -384,5 +392,62 @@ module ::JdbcSpec
     def tables
       @connection.tables(database_name, nil, nil, ["TABLE"])
     end
+
+    def columns(table_name, name=nil)
+      column_definitions(table_name).collect do |column|
+        c = ActiveRecord::ConnectionAdapters::JdbcColumn.new(@config,
+            column["attname"], column["adsrc"], column["format_type"],
+            column["attnotnull"] == 'f')
+        unless native_database_types[c.type][:limit]
+          c.limit = nil
+          c.precision = nil unless c.type == :decimal
+        end
+        c
+      end
+    end
+
+    def recreate_database(name) #:nodoc:
+      drop_database(name)
+      create_database(name)
+    end
+
+    def create_database(name, options = {}) #:nodoc:
+      sqloptions = []
+      ["owner", "tablespace", "template"].each do |option|
+        sqloptions << "#{option.to_s.upcase} = #{options[option]}" if options[option]
+      end
+      if options["encoding"]
+        encoding = options["encoding"]
+        encoding = 'utf8' if encoding == 'unicode'
+        sqloptions << "ENCODING = '#{encoding}'"
+      end
+      sqloptions << "CONNECTION LIMIT = #{options["connlimit"]}" if options["connlimit"]
+      execute "CREATE DATABASE #{name} " + sqloptions.join(" ")
+    end
+
+    def drop_database(name) #:nodoc:
+      execute "DROP DATABASE IF EXISTS #{name}"
+    end
+
+    def column_definitions(table_name)
+      select(<<-end_sql, 'column information')
+        SELECT
+          a.attname,
+          CASE
+            WHEN base.oid IS NOT NULL THEN format_type(base.oid, dom.typtypmod)
+            ELSE format_type(a.atttypid, a.atttypmod)
+          END,
+          d.adsrc, a.attnotnull
+        FROM pg_catalog.pg_attribute a
+        LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+        LEFT JOIN pg_catalog.pg_type dom ON dom.oid = a.atttypid AND dom.typtype = 'd'
+        LEFT JOIN pg_catalog.pg_type base ON base.oid = dom.typbasetype
+        WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = '#{table_name}')
+          AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+       end_sql
+    end
+    private :column_definitions
+
   end  
 end
