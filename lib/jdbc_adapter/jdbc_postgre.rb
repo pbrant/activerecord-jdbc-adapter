@@ -313,7 +313,7 @@ module ::JdbcSpec
       return value.quoted_id if value.respond_to?(:quoted_id)
       
       if value.kind_of?(String) && column && column.type == :binary
-        "'#{escape_bytea(value)}'"
+        "E'#{escape_bytea(value)}'"
       elsif column && column.type == :primary_key
         return value.to_s
       else
